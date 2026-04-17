@@ -49,7 +49,5 @@ public:
                    const uint8_t publicKey[32], const void *message, size_t len);
 private:
         static void sc_muladd(unsigned char *s, const unsigned char *a, const unsigned char *b, const unsigned char *c);
-        static void deriveKeys(SHA512 *hash, limb_t *a, const uint8_t privateKey[32]);
-
 
 };

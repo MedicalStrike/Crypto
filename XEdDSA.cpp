@@ -2,6 +2,15 @@
 #include "utility/LimbUtil.h"
 #include "Crypto.h"
 #include "Curve25519.h"
+#include "RNG.h"
+
+// Needed by `ed25519_priv_sign`.
+static const uint8_t HASH_PADDING_1[32] = {
+    0xfe, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff
+};
 
 // 2^252 + 27742317777372353535851937790883648493
 static limb_t const numQ[NUM_LIMBS_256BIT] PROGMEM = {
@@ -1842,33 +1851,8 @@ void XEdDSA::sc_muladd(unsigned char *s, const unsigned char *a, const unsigned 
     s[31] = s11 >> 17;
 }
 
-
-
 /**
- * \brief Derive key material from a 32-byte private key.
- *
- * \param hash SHA512 hash object from the caller for use in this function.
- * The 64-byte output buffer within this hash object will contain the
- * hash prefix on exit.
- * \param a The secret scalar derived from \a privateKey.  This must be
- * NUM_LIMBS_256BIT limbs in size.
- * \param privateKey The 32-byte private key to derive all other values from.
- */
-void XEdDSA::deriveKeys(SHA512 *hash, limb_t *a, const uint8_t privateKey[32])
-{
-    uint8_t *buf = (uint8_t *)(hash->state.w); // Reuse hash buffer to save memory.
-
-    // Very important, we hash the private key to get a secret for the nonce hash
-    hash->reset();
-    hash->update(privateKey, 32);
-    hash->finalize(buf, 0);
-
-    // Unpack the first half of the hash value into "a".
-    BigNumberUtil::unpackLE(a, NUM_LIMBS_256BIT, privateKey, 32);
-}
-
-/**
- * \brief Signs a message using a specific Ed25519 private key.
+ * \brief Signs a message using a specific XEd25519 private key.
  *
  * \param signature The signature value.
  * \param privateKey The private key to use to sign the message.
@@ -1885,17 +1869,26 @@ void XEdDSA::sign(uint8_t signature[64], const uint8_t privateKey[32],
     uint8_t *buf = (uint8_t *)(hash.state.w); // Reuse hash buffer to save memory.
     limb_t a[NUM_LIMBS_256BIT];
     limb_t r[NUM_LIMBS_256BIT];
-    limb_t k[NUM_LIMBS_256BIT];
+    limb_t h[NUM_LIMBS_256BIT];
     limb_t t[NUM_LIMBS_512BIT + 1];
+    uint8_t nonce[64];
     Point rB;
 
-    // Derive the secret scalar a and the message prefix from the private key.
-    deriveKeys(&hash, a, privateKey);
+    // Unpack secret scalar, maybe unnecessary?
+    BigNumberUtil::unpackLE(a, NUM_LIMBS_256BIT, privateKey, 32);
+
+    // Create secure random nonce
+    CryptRNG.rand(nonce, 64);
 
     // Hash the prefix and the message to derive r.
+    // Use the correct hash_1(X) (mod q) algorithm defined as hash_i(X) (mod q) = hash(2^b-1-i || X) (mod q)
+    // HASH_PADDING_1 is defined as 31 bytes of 0xFF and one byte (HASH_PADDING_1[0]) being 0xFE, equalling 2^b-1-i
+
     hash.reset();
-    hash.update(buf + 32, 32);
+    hash.update(HASH_PADDING_1, 32);
+    hash.update(a, 32);
     hash.update(message, len);
+    hash.update(nonce, 64);
     hash.finalize(buf, 0);
     reduceQFromBuffer(r, buf, t);
 
@@ -1903,16 +1896,16 @@ void XEdDSA::sign(uint8_t signature[64], const uint8_t privateKey[32],
     mul(rB, r);
     encodePoint(signature, rB);
 
-    // Hash R, A, and the message to get k.
+    // Hash R, A, and the message to get h.
     hash.reset();
     hash.update(signature, 32); // R
     hash.update(publicKey, 32); // A
     hash.update(message, len);
     hash.finalize(buf, 0);
-    reduceQFromBuffer(k, buf, t);
+    reduceQFromBuffer(h, buf, t);
 
-    // Compute s = (r + k * a) mod q.
-    Curve25519::mulNoReduce(t, k, a);
+    // Compute s = (r + h * a) mod q.
+    Curve25519::mulNoReduce(t, h, a);
     t[NUM_LIMBS_512BIT] = 0;
     reduceQ(t, t);
     BigNumberUtil::add(t, t, r, NUM_LIMBS_256BIT);
@@ -1922,7 +1915,8 @@ void XEdDSA::sign(uint8_t signature[64], const uint8_t privateKey[32],
     // Clean up.
     clean(a);
     clean(r);
-    clean(k);
+    clean(h);
     clean(t);
+    clean(nonce);
     clean(rB);
 }
